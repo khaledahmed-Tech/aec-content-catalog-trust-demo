@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { catalogAssets, contentRequests, datasetMeta } from "@/src/data";
 import type { ContentType, Discipline, SoftwareCompatibility } from "@/src/types/catalog";
@@ -32,7 +32,7 @@ type RequestFormState = {
 
 const blankForm: RequestFormState = { requestType: "New Content", title: "", discipline: "", desiredContentType: "", software: "", compatibleVersionNeed: "2026", projectNeed: "", requiredBy: "2026-08-14", businessReason: "", substituteAccepted: true, supportingNotes: "", existingAssetId: "" };
 
-export default function RequestsPage() {
+function RequestsPageContent() {
   const searchParams = useSearchParams();
   const [demoState, setDemoState] = useState<DemoRequestState>(emptyDemoRequestState);
   const [form, setForm] = useState<RequestFormState>(blankForm);
@@ -94,4 +94,17 @@ function TextArea({ label, value, onChange }: { label: string; value: string; on
 }
 function Select({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
   return <label className="block text-sm font-semibold text-slate-700">{label}<select className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm" value={value} onChange={(event) => onChange(event.target.value)}><option value="">Select...</option>{options.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
+}
+export default function RequestsPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="rounded-3xl border border-stone-200 bg-white p-6 shadow-sm">
+          Loading request workflow…
+        </div>
+      }
+    >
+      <RequestsPageContent />
+    </Suspense>
+  );
 }

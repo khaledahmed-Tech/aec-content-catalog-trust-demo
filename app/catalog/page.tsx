@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { Suspense, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { catalogAssets } from "@/src/data";
 import type { ApprovalStatus, ContentType, Discipline, DuplicateRisk, SoftwareCompatibility, TrustBand } from "@/src/types/catalog";
@@ -36,7 +36,7 @@ function AssetCard({ result }: { result: RankedCatalogAsset }) {
   return <article className="card grid gap-5 md:grid-cols-[180px_1fr]"><PlaceholderPreview /><div><div className="flex flex-wrap items-center gap-2"><StatusBadge status={result.asset.approvalStatus} /><TrustBadge band={trust.band} /><WarningBadge count={warningCount} /></div><h3 className="mt-4 text-xl font-bold text-slate-950"><Link className="hover:text-[var(--action)]" href={`/catalog/${result.asset.assetId}`}>{result.asset.name}</Link></h3><p className="mt-2 text-sm leading-6 text-slate-600">{result.asset.description}</p><dl className="mt-4 grid gap-2 text-sm sm:grid-cols-2"><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Type</dt><dd>{result.asset.contentType}</dd></div><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Discipline</dt><dd>{result.asset.discipline}</dd></div><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Version</dt><dd>{result.asset.version}</dd></div><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Usage</dt><dd>{result.asset.usageCount} synthetic selections</dd></div><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Updated</dt><dd>{result.asset.lastUpdated}</dd></div><div><dt className="text-xs font-semibold uppercase tracking-widest text-slate-400">Software metadata</dt><dd>{result.asset.software} · {result.asset.compatibleVersions.join(", ")}</dd></div></dl><Link className="button mt-5 inline-flex" href={`/catalog/${result.asset.assetId}`}>Review record →</Link></div></article>;
 }
 
-export default function Catalog() {
+function CatalogContent() {
   const searchParams = useSearchParams();
   const initialQuery = searchParams.get("q") ?? (searchParams.get("scenario") === "metric-single-flush-door" ? "single flush door 900" : "single flush door");
   const [draftQuery, setDraftQuery] = useState(initialQuery);
@@ -56,4 +56,17 @@ export default function Catalog() {
 
 function Select({ label, value, options, onChange }: { label: string; value: string; options: string[]; onChange: (value: string) => void }) {
   return <label className="block text-sm font-semibold text-slate-700">{label}<select className="mt-2 w-full rounded-xl border border-slate-300 px-3 py-2.5 text-sm" value={value} onChange={(event) => onChange(event.target.value)}><option value="">Any</option>{options.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
+}
+export default function Catalog() {
+  return (
+    <Suspense
+      fallback={
+        <div className="rounded-3xl border border-stone-200 bg-white p-6 shadow-sm">
+          Loading catalog walkthrough…
+        </div>
+      }
+    >
+      <CatalogContent />
+    </Suspense>
+  );
 }

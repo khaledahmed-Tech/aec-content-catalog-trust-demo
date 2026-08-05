@@ -83,4 +83,163 @@ export function getAdminReviewPriority(item: AdminReviewItem, assets: ReadonlyAr
   return { score, band: priorityBand(score), treatment: "Explainable triage aid; admins still make the decision.", components };
 }
 function withinFilters<T extends { occurredAt?: string; submittedAt?: string; discipline?: string | null; contentType?: string | null; software?: string | null; desiredContentType?: string }>(item: T, filters: TelemetryFilters): boolean { const date = item.occurredAt ?? item.submittedAt; if (filters.startDate && date && date < filters.startDate) return false; if (filters.endDate && date && date.slice(0, 10) > filters.endDate) return false; if (filters.discipline && item.discipline !== filters.discipline) return false; if (filters.contentType && (item.contentType ?? item.desiredContentType) !== filters.contentType) return false; if (filters.software && item.software !== filters.software) return false; return true; }
-export function calculateTelemetrySummary(events: ReadonlyArray<TelemetryEvent>, assets: ReadonlyArray<CatalogAsset>, requests: ReadonlyArray<ContentRequest>, failedSearches: ReadonlyArray<FailedSearchExample>, governanceWarnings: ReadonlyArray<SeedGovernanceWarning>, filters: TelemetryFilters = {}, asOfDate = SYNTHETIC_AS_OF_DATE): TelemetrySummary { const filteredEvents = events.filter((event) => withinFilters(event, filters)); const filteredAssets = assets.filter((asset) => withinFilters(asset, filters)); const filteredRequests = requests.filter((request) => withinFilters(request, filters)); const searchBySession = [...filteredEvents].filter((event) => event.eventType === "search_executed").sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).reduce<Map<string, TelemetryEvent>>((map, event) => map.has(event.sessionId) ? map : map.set(event.sessionId, event), new Map()); const searches = Array.from(searchBySession.values()); const selections = filteredEvents.filter((event) => event.eventType === "reuse_selected"); const blocked = filteredEvents.filter((event) => event.eventType === "reuse_blocked"); const convertedSessions = searches.filter((search) => selections.some((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt)); const selectionTimes = convertedSessions.map((search) => { const firstSelection = selections.filter((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt).sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))[0]; return (new Date(firstSelection.occurredAt).getTime() - new Date(search.occurredAt).getTime()) / 1000; }); const terminalRequests = filteredRequests.filter((request) => ["Fulfilled", "Declined"].includes(request.status)); const openRequests = filteredRequests.filter((request) => !["Fulfilled", "Declined"].includes(request.status)); const pendingReviewAging = { under7: 0, days7To14: 0, days15To30: 0, over30: 0 }; openRequests.forEach((request) => { const age = daysBetween(request.submittedAt, asOfDate); if (age < 7) pendingReviewAging.under7 += 1; else if (age <= 14) pendingReviewAging.days7To14 += 1; else if (age <= 30) pendingReviewAging.days15To30 += 1; else pendingReviewAging.over30 += 1; }); const metadataCompletenessDistribution = { under70: 0, from70To84: 0, from85To94: 0, from95To100: 0 }; filteredAssets.forEach((asset) => { if (asset.metadataCompleteness < 70) metadataCompletenessDistribution.under70 += 1; else if (asset.metadataCompleteness <= 84) metadataCompletenessDistribution.from70To84 += 1; else if (asset.metadataCompleteness <= 94) metadataCompletenessDistribution.from85To94 += 1; else metadataCompletenessDistribution.from95To100 += 1; }); const filteredFailed = failedSearches.filter((search) => withinFilters({ occurredAt: search.occurredAt, discipline: search.activeFilters.discipline ?? null, contentType: search.activeFilters.contentType ?? null, software: search.activeFilters.software ?? null }, filters)); const disciplines = Array.from(new Set([...filteredAssets.map((asset) => asset.discipline), ...filteredRequests.map((request) => request.discipline), ...filteredFailed.map((search) => search.activeFilters.discipline).filter(Boolean)])].sort(); const unmetDemandByDiscipline = disciplines.map((discipline) => { const zeroResultSearches = filteredFailed.filter((search) => search.activeFilters.discipline === discipline).length + searches.filter((search) => search.discipline === discipline && search.resultCount === 0).length; const open = openRequests.filter((request) => request.discipline === discipline).length; return { discipline: discipline ?? "Unspecified", zeroResultSearches, openRequests: open, total: zeroResultSearches + open }; }).filter((entry) => entry.total > 0); const staleApprovedAssets = filteredAssets.filter((asset) => asset.approvalStatus === "Approved" && daysBetween(asset.lastUpdated, asOfDate) > 365).sort((a, b) => a.assetId.localeCompare(b.assetId)); const mostReusedApprovedAssets = filteredAssets.filter((asset) => asset.approvalStatus === "Approved").sort((a, b) => b.usageCount - a.usageCount || a.assetId.localeCompare(b.assetId)); const medianOpenAge = median(openRequests.map((request) => daysBetween(request.submittedAt, asOfDate))); const opportunityCards: ProductOpportunityCard[] = []; const searchesByDiscipline = new Map<string, { total: number; zero: number }>(); searches.forEach((search) => { const key = search.discipline ?? "Unspecified"; const current = searchesByDiscipline.get(key) ?? { total: 0, zero: 0 }; current.total += 1; if (search.resultCount === 0) current.zero += 1; searchesByDiscipline.set(key, current); }); searchesByDiscipline.forEach((counts, discipline) => { if (counts.total >= 10 && counts.zero / counts.total > 0.2) opportunityCards.push({ title: "Coverage gap", observation: `Zero-result rate crossed the investigation threshold for ${discipline}.`, evidence: `${counts.zero} of ${counts.total} ${discipline} search sessions returned zero results. Trigger: >20% zero-result rate with at least 10 searches.`, discoveryQuestion: "Which recurring search intents are missing, and are taxonomy or content supply the primary problem?" }); }); const totalSelections = selections.length + blocked.length; const staleSelections = selections.filter((selection) => staleApprovedAssets.some((asset) => asset.assetId === selection.assetId)).length; if (staleApprovedAssets.length >= 5 && totalSelections > 0 && staleSelections / totalSelections >= 0.2) opportunityCards.push({ title: "High-use stale content", observation: "Stale approved records are material in synthetic selection behavior.", evidence: `${staleApprovedAssets.length} stale approved assets represented ${staleSelections} of ${totalSelections} selection attempts. Trigger: >=5 stale approved assets and >=20% of selections.`, discoveryQuestion: "What review evidence would content owners need to refresh these records?" }); if (medianOpenAge !== null && medianOpenAge > 14) opportunityCards.push({ title: "Governance bottleneck", observation: "Open request age suggests an operational triage discussion.", evidence: `Median open request age is ${medianOpenAge} days. Trigger: median open request age >14 days.`, discoveryQuestion: "Is the delay caused by missing context, capacity, ownership, or decision rights?" }); const highDuplicateCount = filteredAssets.filter((asset) => asset.duplicateRisk === "High").length; if (filteredAssets.length > 0 && highDuplicateCount / filteredAssets.length > 0.1) opportunityCards.push({ title: "Duplicate governance", observation: "High duplicate-risk records are prominent in this context.", evidence: `${highDuplicateCount} of ${filteredAssets.length} assets have High duplicate risk. Trigger: >10% of assets in context.`, discoveryQuestion: "Where do naming, ownership, or lifecycle rules fail to distinguish alternatives?" }); return { searchSuccessRate: safeRate(searches.filter((search) => (search.resultCount ?? 0) > 0).length, searches.length), zeroResultRate: safeRate(searches.filter((search) => search.resultCount === 0).length, searches.length), searchToSelectionConversion: safeRate(convertedSessions.length, searches.length), approvedSelectionRate: safeRate(selections.filter((selection) => selection.approvalStatusAtEvent === "Approved").length, selections.length), blockedAttemptRate: safeRate(blocked.length, selections.length + blocked.length), medianTimeToSelectionSeconds: median(selectionTimes), requestFulfillmentRate: safeRate(terminalRequests.filter((request) => request.status === "Fulfilled").length, terminalRequests.length), medianOpenRequestAgeDays: medianOpenAge, pendingReviewAging, metadataCompletenessDistribution, staleApprovedAssets, mostReusedApprovedAssets, unmetDemandByDiscipline, opportunityCards }; }
+export function calculateTelemetrySummary(
+  events: ReadonlyArray<TelemetryEvent>,
+  assets: ReadonlyArray<CatalogAsset>,
+  requests: ReadonlyArray<ContentRequest>,
+  failedSearches: ReadonlyArray<FailedSearchExample>,
+  governanceWarnings: ReadonlyArray<SeedGovernanceWarning>,
+  filters: TelemetryFilters = {},
+  asOfDate = SYNTHETIC_AS_OF_DATE,
+): TelemetrySummary {
+  void governanceWarnings;
+
+  const filteredEvents = events.filter((event) => withinFilters(event, filters));
+  const filteredAssets = assets.filter((asset) => withinFilters(asset, filters));
+  const filteredRequests = requests.filter((request) => withinFilters(request, filters));
+
+  const searchBySession = filteredEvents
+    .filter((event) => event.eventType === "search_executed")
+    .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))
+    .reduce<Map<string, TelemetryEvent>>(
+      (map, event) => (map.has(event.sessionId) ? map : map.set(event.sessionId, event)),
+      new Map(),
+    );
+  const searches = Array.from(searchBySession.values());
+  const selections = filteredEvents.filter((event) => event.eventType === "reuse_selected");
+  const blocked = filteredEvents.filter((event) => event.eventType === "reuse_blocked");
+
+  const convertedSessions = searches.filter((search) =>
+    selections.some((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt),
+  );
+  const selectionTimes = convertedSessions.map((search) => {
+    const firstSelection = selections
+      .filter((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt)
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))[0];
+    return (new Date(firstSelection.occurredAt).getTime() - new Date(search.occurredAt).getTime()) / 1000;
+  });
+
+  const terminalRequests = filteredRequests.filter((request) => ["Fulfilled", "Declined"].includes(request.status));
+  const openRequests = filteredRequests.filter((request) => !["Fulfilled", "Declined"].includes(request.status));
+  const pendingReviewAging = { under7: 0, days7To14: 0, days15To30: 0, over30: 0 };
+  openRequests.forEach((request) => {
+    const age = daysBetween(request.submittedAt, asOfDate);
+    if (age < 7) pendingReviewAging.under7 += 1;
+    else if (age <= 14) pendingReviewAging.days7To14 += 1;
+    else if (age <= 30) pendingReviewAging.days15To30 += 1;
+    else pendingReviewAging.over30 += 1;
+  });
+
+  const metadataCompletenessDistribution = { under70: 0, from70To84: 0, from85To94: 0, from95To100: 0 };
+  filteredAssets.forEach((asset) => {
+    if (asset.metadataCompleteness < 70) metadataCompletenessDistribution.under70 += 1;
+    else if (asset.metadataCompleteness <= 84) metadataCompletenessDistribution.from70To84 += 1;
+    else if (asset.metadataCompleteness <= 94) metadataCompletenessDistribution.from85To94 += 1;
+    else metadataCompletenessDistribution.from95To100 += 1;
+  });
+
+  const filteredFailed = failedSearches.filter((search) =>
+    withinFilters(
+      {
+        occurredAt: search.occurredAt,
+        discipline: search.activeFilters.discipline ?? null,
+        contentType: search.activeFilters.contentType ?? null,
+        software: search.activeFilters.software ?? null,
+      },
+      filters,
+    ),
+  );
+
+  const disciplines = Array.from(
+    new Set(
+      [
+        ...filteredAssets.map((asset) => asset.discipline),
+        ...filteredRequests.map((request) => request.discipline),
+        ...filteredFailed.map((search) => search.activeFilters.discipline),
+      ].filter(Boolean),
+    ),
+  ).sort();
+
+  const unmetDemandByDiscipline = disciplines
+    .map((discipline) => {
+      const zeroResultSearches =
+        filteredFailed.filter((search) => search.activeFilters.discipline === discipline).length +
+        searches.filter((search) => search.discipline === discipline && search.resultCount === 0).length;
+      const open = openRequests.filter((request) => request.discipline === discipline).length;
+      return { discipline: discipline ?? "Unspecified", zeroResultSearches, openRequests: open, total: zeroResultSearches + open };
+    })
+    .filter((entry) => entry.total > 0);
+
+  const staleApprovedAssets = filteredAssets
+    .filter((asset) => asset.approvalStatus === "Approved" && daysBetween(asset.lastUpdated, asOfDate) > 365)
+    .sort((a, b) => a.assetId.localeCompare(b.assetId));
+  const mostReusedApprovedAssets = filteredAssets
+    .filter((asset) => asset.approvalStatus === "Approved")
+    .sort((a, b) => b.usageCount - a.usageCount || a.assetId.localeCompare(b.assetId));
+  const medianOpenAge = median(openRequests.map((request) => daysBetween(request.submittedAt, asOfDate)));
+
+  const opportunityCards: ProductOpportunityCard[] = [];
+  const searchesByDiscipline = new Map<string, { total: number; zero: number }>();
+  searches.forEach((search) => {
+    const key = search.discipline ?? "Unspecified";
+    const current = searchesByDiscipline.get(key) ?? { total: 0, zero: 0 };
+    current.total += 1;
+    if (search.resultCount === 0) current.zero += 1;
+    searchesByDiscipline.set(key, current);
+  });
+  searchesByDiscipline.forEach((counts, discipline) => {
+    if (counts.total >= 10 && counts.zero / counts.total > 0.2) {
+      opportunityCards.push({
+        title: "Coverage gap",
+        observation: `Zero-result rate crossed the investigation threshold for ${discipline}.`,
+        evidence: `${counts.zero} of ${counts.total} ${discipline} search sessions returned zero results. Trigger: >20% zero-result rate with at least 10 searches.`,
+        discoveryQuestion: "Which recurring search intents are missing, and are taxonomy or content supply the primary problem?",
+      });
+    }
+  });
+
+  const totalSelections = selections.length + blocked.length;
+  const staleSelections = selections.filter((selection) => staleApprovedAssets.some((asset) => asset.assetId === selection.assetId)).length;
+  if (staleApprovedAssets.length >= 5 && totalSelections > 0 && staleSelections / totalSelections >= 0.2) {
+    opportunityCards.push({
+      title: "High-use stale content",
+      observation: "Stale approved records are material in synthetic selection behavior.",
+      evidence: `${staleApprovedAssets.length} stale approved assets represented ${staleSelections} of ${totalSelections} selection attempts. Trigger: >=5 stale approved assets and >=20% of selections.`,
+      discoveryQuestion: "What review evidence would content owners need to refresh these records?",
+    });
+  }
+  if (medianOpenAge !== null && medianOpenAge > 14) {
+    opportunityCards.push({
+      title: "Governance bottleneck",
+      observation: "Open request age suggests an operational triage discussion.",
+      evidence: `Median open request age is ${medianOpenAge} days. Trigger: median open request age >14 days.`,
+      discoveryQuestion: "Is the delay caused by missing context, capacity, ownership, or decision rights?",
+    });
+  }
+  const highDuplicateCount = filteredAssets.filter((asset) => asset.duplicateRisk === "High").length;
+  if (filteredAssets.length > 0 && highDuplicateCount / filteredAssets.length > 0.1) {
+    opportunityCards.push({
+      title: "Duplicate governance",
+      observation: "High duplicate-risk records are prominent in this context.",
+      evidence: `${highDuplicateCount} of ${filteredAssets.length} assets have High duplicate risk. Trigger: >10% of assets in context.`,
+      discoveryQuestion: "Where do naming, ownership, or lifecycle rules fail to distinguish alternatives?",
+    });
+  }
+
+  return {
+    searchSuccessRate: safeRate(searches.filter((search) => (search.resultCount ?? 0) > 0).length, searches.length),
+    zeroResultRate: safeRate(searches.filter((search) => search.resultCount === 0).length, searches.length),
+    searchToSelectionConversion: safeRate(convertedSessions.length, searches.length),
+    approvedSelectionRate: safeRate(selections.filter((selection) => selection.approvalStatusAtEvent === "Approved").length, selections.length),
+    blockedAttemptRate: safeRate(blocked.length, selections.length + blocked.length),
+    medianTimeToSelectionSeconds: median(selectionTimes),
+    requestFulfillmentRate: safeRate(terminalRequests.filter((request) => request.status === "Fulfilled").length, terminalRequests.length),
+    medianOpenRequestAgeDays: medianOpenAge,
+    pendingReviewAging,
+    metadataCompletenessDistribution,
+    staleApprovedAssets,
+    mostReusedApprovedAssets,
+    unmetDemandByDiscipline,
+    opportunityCards,
+  };
+}
