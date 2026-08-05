@@ -1,0 +1,245 @@
+import { datasetMeta } from "../data/dataset-meta";
+import type { CatalogAsset, DuplicateRisk, TrustBand } from "../types/catalog";
+import type { AdminReviewItem, CatalogFilters, ContentRequest } from "../types/requests";
+import type { FailedSearchExample, TelemetryEvent } from "../types/telemetry";
+import type { GovernanceWarning as SeedGovernanceWarning } from "../types/catalog";
+
+export type WarningLevel = "Block" | "High" | "Caution";
+export interface ReuseContext { compatibleVersion?: string }
+export interface ReuseEligibilityResult { eligible: boolean; reasons: string[] }
+export interface TrustScoreResult { score: number; band: TrustBand; bandLabel: string; components: { governanceEvidence: number; metadataPoints: number; lifecycleClarity: number; recordFreshness: number; duplicateConfidence: number }; displayLanguage: string }
+export interface RankedCatalogAsset { asset: CatalogAsset; eligible: boolean; eligibilityReasons: string[]; rankScore: number; textMatch: number; trustScore: number; freshnessNormalized: number; usageNormalized: number }
+export interface RankedSearchResults { eligibleResults: RankedCatalogAsset[]; governedExceptions: RankedCatalogAsset[] }
+export interface GovernanceWarningResult { severity: WarningLevel; message: string; nextAction: string; relatedAssetIds: string[] }
+export interface PriorityComponent { label: string; points: number; explanation: string }
+export interface AdminPriorityResult { score: number; band: "Urgent" | "High" | "Normal"; treatment: string; components: PriorityComponent[] }
+export interface RateResult { numerator: number; denominator: number; value: number | null; displayValue: string }
+export interface TelemetryFilters { startDate?: string; endDate?: string; discipline?: CatalogFilters["discipline"]; contentType?: CatalogFilters["contentType"]; software?: CatalogFilters["software"] }
+export interface ProductOpportunityCard { title: string; observation: string; evidence: string; discoveryQuestion: string }
+export interface TelemetrySummary { searchSuccessRate: RateResult; zeroResultRate: RateResult; searchToSelectionConversion: RateResult; approvedSelectionRate: RateResult; blockedAttemptRate: RateResult; medianTimeToSelectionSeconds: number | null; requestFulfillmentRate: RateResult; medianOpenRequestAgeDays: number | null; pendingReviewAging: { under7: number; days7To14: number; days15To30: number; over30: number }; metadataCompletenessDistribution: { under70: number; from70To84: number; from85To94: number; from95To100: number }; staleApprovedAssets: CatalogAsset[]; mostReusedApprovedAssets: CatalogAsset[]; unmetDemandByDiscipline: Array<{ discipline: string; zeroResultSearches: number; openRequests: number; total: number }>; opportunityCards: ProductOpportunityCard[] }
+
+const SYNTHETIC_AS_OF_DATE: string = datasetMeta.asOfDate;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+export function normalizeSearchText(value: string): string { return value.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " "); }
+export function daysBetween(fromDate: string, toDate = SYNTHETIC_AS_OF_DATE): number { const from = new Date(fromDate); const to = new Date(toDate); if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return Number.POSITIVE_INFINITY; return Math.floor((Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()) - Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate())) / MS_PER_DAY); }
+export function median(values: number[]): number | null { if (values.length === 0) return null; const sorted = [...values].sort((a, b) => a - b); const middle = Math.floor(sorted.length / 2); return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2; }
+export function safeRate(numerator: number, denominator: number): RateResult { const value = denominator === 0 ? null : numerator / denominator; return { numerator, denominator, value, displayValue: value === null ? "Not enough data" : `${Math.round(value * 10000) / 100}%` }; }
+function freshnessPoints(lastUpdated: string, asOfDate = SYNTHETIC_AS_OF_DATE): number { const age = daysBetween(lastUpdated, asOfDate); if (age <= 180) return 15; if (age <= 365) return 10; if (age <= 730) return 5; return 0; }
+function freshnessNormalized(lastUpdated: string, asOfDate = SYNTHETIC_AS_OF_DATE): number { const age = daysBetween(lastUpdated, asOfDate); if (age <= 180) return 100; if (age <= 365) return 67; if (age <= 730) return 33; return 0; }
+function duplicateConfidence(risk: DuplicateRisk): number { return risk === "Low" ? 15 : risk === "Medium" ? 8 : 0; }
+function trustBand(score: number): TrustBand { if (score >= 85) return "High"; if (score >= 70) return "Moderate"; return "Low"; }
+function isActiveStatus(asset: CatalogAsset): boolean { return ["Approved", "Pending Review", "Needs Revision"].includes(asset.approvalStatus); }
+
+export function calculateReuseEligibility(asset: CatalogAsset, context: ReuseContext = {}): ReuseEligibilityResult { const reasons: string[] = []; if (asset.approvalStatus !== "Approved") reasons.push(`Approval status is ${asset.approvalStatus}, not Approved.`); if (asset.deprecatedReason !== null) reasons.push("A lifecycle replacement or deprecation reason blocks governed reuse."); if (!asset.version) reasons.push("The displayed current version is missing."); if (context.compatibleVersion && !asset.compatibleVersions.includes(context.compatibleVersion)) reasons.push(`Declared compatible versions do not include ${context.compatibleVersion}.`); return { eligible: reasons.length === 0, reasons: reasons.length === 0 ? ["Approved record with a current displayed version and matching declared context."] : reasons }; }
+
+export function calculateTrustScore(asset: CatalogAsset, asOfDate = SYNTHETIC_AS_OF_DATE): TrustScoreResult { // Synthetic demo heuristic only; this does not validate BIM content or production fitness.
+  const governanceEvidence = asset.approvalStatus === "Approved" ? 30 : asset.approvalStatus === "Pending Review" ? 10 : asset.approvalStatus === "Needs Revision" ? 5 : 0; const metadataPoints = Math.max(0, Math.min(100, asset.metadataCompleteness)) * 0.2; const lifecycleClarity = isActiveStatus(asset) && asset.deprecatedReason === null ? 20 : asset.approvalStatus === "Superseded" && asset.deprecatedReason ? 8 : asset.approvalStatus === "Deprecated" && asset.deprecatedReason ? 5 : 0; const recordFreshness = freshnessPoints(asset.lastUpdated, asOfDate); const duplicate = duplicateConfidence(asset.duplicateRisk); const score = Math.round(governanceEvidence + metadataPoints + lifecycleClarity + recordFreshness + duplicate); const band = trustBand(score); const bandLabel = band === "High" ? "High catalog confidence" : band === "Moderate" ? "Moderate catalog confidence — review cautions" : "Low catalog confidence — inspect evidence"; return { score, band, bandLabel, components: { governanceEvidence, metadataPoints, lifecycleClarity, recordFreshness, duplicateConfidence: duplicate }, displayLanguage: "Synthetic catalog-record confidence based on governance evidence, metadata, lifecycle clarity, freshness, and duplicate confidence." }; }
+
+function textMatchScore(asset: CatalogAsset, query: string): number { const normalizedQuery = normalizeSearchText(query); if (!normalizedQuery) return 100; const name = normalizeSearchText(asset.name); const tags = asset.tags.map(normalizeSearchText); const params = asset.parameters.map((p) => normalizeSearchText(`${p.name} ${p.value} ${p.unit ?? ""}`)); const tokens = Array.from(new Set(normalizedQuery.split(" ").filter(Boolean))); let score = name === normalizedQuery ? 60 : name.includes(normalizedQuery) ? 40 : 0; score += Math.min(30, tokens.filter((token) => name.split(" ").includes(token) || name.includes(token)).length * 10); score += Math.min(18, tokens.filter((token) => tags.some((tag) => tag.split(" ").includes(token) || tag.includes(token))).length * 6); score += Math.min(12, tokens.filter((token) => params.some((param) => param.includes(token))).length * 4); return Math.min(100, score); }
+function passesFilters(asset: CatalogAsset, filters: CatalogFilters): boolean { if (filters.discipline && asset.discipline !== filters.discipline) return false; if (filters.contentType && asset.contentType !== filters.contentType) return false; if (filters.software && asset.software !== filters.software) return false; if (filters.compatibleVersion && !asset.compatibleVersions.includes(filters.compatibleVersion)) return false; if (filters.approvalStatus && asset.approvalStatus !== filters.approvalStatus) return false; if (filters.trustBand && calculateTrustScore(asset).band !== filters.trustBand) return false; if (filters.duplicateRisk && asset.duplicateRisk !== filters.duplicateRisk) return false; if (filters.updatedWithinDays && daysBetween(asset.lastUpdated) > filters.updatedWithinDays) return false; return true; }
+export function rankSearchResults(assets: ReadonlyArray<CatalogAsset>, query: string, filters: CatalogFilters = {}, asOfDate = SYNTHETIC_AS_OF_DATE): RankedSearchResults { const filtered = assets.filter((asset) => passesFilters(asset, filters)); const ranked = filtered.map((asset): RankedCatalogAsset => { const eligibility = calculateReuseEligibility(asset, { compatibleVersion: filters.compatibleVersion }); const trust = calculateTrustScore(asset, asOfDate).score; const textMatch = textMatchScore(asset, query); const fresh = freshnessNormalized(asset.lastUpdated, asOfDate); const usage = Math.min(100, (Math.log10(asset.usageCount + 1) / 3) * 100); return { asset, eligible: eligibility.eligible, eligibilityReasons: eligibility.reasons, rankScore: Math.round((0.65 * textMatch + 0.15 * trust + 0.1 * fresh + 0.1 * usage) * 100) / 100, textMatch, trustScore: trust, freshnessNormalized: fresh, usageNormalized: usage }; }); const sortRanked = (items: RankedCatalogAsset[]) => items.sort((a, b) => b.rankScore - a.rankScore || b.textMatch - a.textMatch || b.trustScore - a.trustScore || new Date(b.asset.lastUpdated).getTime() - new Date(a.asset.lastUpdated).getTime() || b.asset.usageCount - a.asset.usageCount || a.asset.assetId.localeCompare(b.asset.assetId)); return { eligibleResults: sortRanked(ranked.filter((item) => item.eligible)), governedExceptions: filters.governedOnly === false ? sortRanked(ranked.filter((item) => !item.eligible)) : [] }; }
+
+export function getGovernanceWarnings(asset: CatalogAsset, context: ReuseContext = {}, asOfDate = SYNTHETIC_AS_OF_DATE): GovernanceWarningResult[] { const warnings: GovernanceWarningResult[] = []; const add = (warning: GovernanceWarningResult) => { if (!warnings.some((existing) => existing.message === warning.message)) warnings.push(warning); }; if (asset.approvalStatus !== "Approved") add({ severity: "Block", message: "Not eligible for governed reuse", nextAction: "Review status or request approved content", relatedAssetIds: [] }); if (asset.deprecatedReason || ["Superseded", "Deprecated"].includes(asset.approvalStatus)) add({ severity: "Block", message: `Lifecycle block${asset.deprecatedReason ? `: ${asset.deprecatedReason}` : " with missing reason"}`, nextAction: "Use linked replacement or submit request", relatedAssetIds: asset.deprecatedReason?.match(/AEC-AST-\d{4}/g) ?? [] }); if (context.compatibleVersion && !asset.compatibleVersions.includes(context.compatibleVersion)) add({ severity: "Block", message: "Declared compatibility mismatch", nextAction: "Change context or request compatible content", relatedAssetIds: [] }); if (asset.metadataCompleteness < 70) add({ severity: "High", message: "Material metadata gaps", nextAction: "Inspect missing fields or request correction", relatedAssetIds: [] }); else if (asset.metadataCompleteness <= 84) add({ severity: "Caution", message: "Metadata is incomplete", nextAction: "Review parameters and owner details", relatedAssetIds: [] }); if (asset.duplicateRisk === "High") add({ severity: "High", message: "Possible duplicate or ambiguous record", nextAction: "Compare alternatives or ask admin", relatedAssetIds: asset.warningMessage?.match(/AEC-AST-\d{4}/g) ?? [] }); else if (asset.duplicateRisk === "Medium") add({ severity: "Caution", message: "Possible overlap with another record", nextAction: "Review name, owner, and version", relatedAssetIds: asset.warningMessage?.match(/AEC-AST-\d{4}/g) ?? [] }); if (daysBetween(asset.lastUpdated, asOfDate) > 365) add({ severity: "Caution", message: "Record may be stale", nextAction: "Verify with content owner", relatedAssetIds: [] }); if (asset.approvalStatus === "Approved" && calculateTrustScore(asset, asOfDate).score < 70) add({ severity: "Caution", message: "Approved but weak catalog evidence", nextAction: "Selection remains possible; show acknowledgement", relatedAssetIds: [] }); const weight = { Block: 0, High: 1, Caution: 2 } satisfies Record<WarningLevel, number>; return warnings.sort((a, b) => weight[a.severity] - weight[b.severity] || a.message.localeCompare(b.message)); }
+function priorityBand(score: number): "Urgent" | "High" | "Normal" { if (score >= 70) return "Urgent"; if (score >= 40) return "High"; return "Normal"; }
+export function getAdminReviewPriority(item: AdminReviewItem, assets: ReadonlyArray<CatalogAsset>, requests: ReadonlyArray<ContentRequest>, asOfDate = SYNTHETIC_AS_OF_DATE): AdminPriorityResult {
+  if (item.itemType === "Content Submission") {
+    const asset = assets.find((candidate) => candidate.assetId === item.entityId);
+    if (!asset) throw new Error(`Admin review item ${item.reviewItemId} does not link to a catalog asset.`);
+    const governanceBlock = ["Pending Review", "Needs Revision"].includes(asset.approvalStatus) ? 30 : 0;
+    const duplicateRisk = asset.duplicateRisk === "High" ? 25 : asset.duplicateRisk === "Medium" ? 10 : 0;
+    const metadataGap = asset.metadataCompleteness < 70 ? 20 : asset.metadataCompleteness <= 84 ? 10 : 0;
+    const queueAgeDays = daysBetween(item.submittedAt, asOfDate);
+    const queueAge = queueAgeDays > 14 ? 15 : queueAgeDays >= 7 ? 8 : 3;
+    const historicalUsage = asset.usageCount >= 100 ? 10 : asset.usageCount >= 25 ? 5 : 0;
+    const components: PriorityComponent[] = [
+      { label: "Governance block", points: governanceBlock, explanation: `${asset.approvalStatus} status contributes ${governanceBlock} points.` },
+      { label: "Duplicate risk", points: duplicateRisk, explanation: `${asset.duplicateRisk} duplicate risk contributes ${duplicateRisk} points.` },
+      { label: "Metadata gap", points: metadataGap, explanation: `${asset.metadataCompleteness}% metadata completeness contributes ${metadataGap} points.` },
+      { label: "Queue age", points: queueAge, explanation: `Review item age is ${queueAgeDays} days.` },
+      { label: "Historical usage", points: historicalUsage, explanation: `${asset.usageCount} synthetic uses contributes ${historicalUsage} points.` },
+    ];
+    const score = components.reduce((sum, component) => sum + component.points, 0);
+    return { score, band: priorityBand(score), treatment: "Explainable submission triage aid; admins still make the decision.", components };
+  }
+
+  const request = requests.find((candidate) => candidate.requestId === item.entityId);
+  if (!request) throw new Error(`Admin review item ${item.reviewItemId} does not link to a content request.`);
+  const demandEvidence = request.relatedZeroResultCount >= 20 || request.relatedOpenRequestCount >= 4 ? 30 : request.relatedZeroResultCount >= 10 || request.relatedOpenRequestCount >= 2 ? 20 : request.relatedZeroResultCount >= 3 || request.relatedOpenRequestCount >= 1 ? 10 : 0;
+  const daysUntilRequired = request.requiredBy ? daysBetween(asOfDate, request.requiredBy) : Number.POSITIVE_INFINITY;
+  const requiredByProximity = daysUntilRequired <= 3 ? 25 : daysUntilRequired <= 7 ? 20 : daysUntilRequired <= 14 ? 12 : 5;
+  const age = daysBetween(request.submittedAt, asOfDate);
+  const requestAge = age > 30 ? 20 : age >= 15 ? 15 : age >= 7 ? 8 : 3;
+  const coverageGap = request.coverageStatus === "No Approved Candidate" ? 15 : request.coverageStatus === "Weak Candidate Only" ? 8 : 0;
+  const noAcceptableSubstitute = request.substituteAccepted ? 0 : 10;
+  const components: PriorityComponent[] = [
+    { label: "Demand evidence", points: demandEvidence, explanation: `${request.relatedZeroResultCount} related zero-result searches and ${request.relatedOpenRequestCount} open similar requests.` },
+    { label: "Required-by proximity", points: requiredByProximity, explanation: request.requiredBy ? `Required by ${request.requiredBy}.` : "No required-by date supplied." },
+    { label: "Request age", points: requestAge, explanation: `Request age is ${age} days.` },
+    { label: "Coverage gap", points: coverageGap, explanation: request.coverageStatus },
+    { label: "No acceptable substitute", points: noAcceptableSubstitute, explanation: request.substituteAccepted ? "Requester accepts a substitute." : "Requester does not accept a substitute." },
+  ];
+  const score = components.reduce((sum, component) => sum + component.points, 0);
+  return { score, band: priorityBand(score), treatment: "Explainable triage aid; admins still make the decision.", components };
+}
+function withinFilters<T extends { occurredAt?: string; submittedAt?: string; discipline?: string | null; contentType?: string | null; software?: string | null; desiredContentType?: string }>(item: T, filters: TelemetryFilters): boolean { const date = item.occurredAt ?? item.submittedAt; if (filters.startDate && date && date < filters.startDate) return false; if (filters.endDate && date && date.slice(0, 10) > filters.endDate) return false; if (filters.discipline && item.discipline !== filters.discipline) return false; if (filters.contentType && (item.contentType ?? item.desiredContentType) !== filters.contentType) return false; if (filters.software && item.software !== filters.software) return false; return true; }
+export function calculateTelemetrySummary(
+  events: ReadonlyArray<TelemetryEvent>,
+  assets: ReadonlyArray<CatalogAsset>,
+  requests: ReadonlyArray<ContentRequest>,
+  failedSearches: ReadonlyArray<FailedSearchExample>,
+  governanceWarnings: ReadonlyArray<SeedGovernanceWarning>,
+  filters: TelemetryFilters = {},
+  asOfDate = SYNTHETIC_AS_OF_DATE,
+): TelemetrySummary {
+  void governanceWarnings;
+
+  const filteredEvents = events.filter((event) => withinFilters(event, filters));
+  const filteredAssets = assets.filter((asset) => withinFilters(asset, filters));
+  const filteredRequests = requests.filter((request) => withinFilters(request, filters));
+
+  const searchBySession = filteredEvents
+    .filter((event) => event.eventType === "search_executed")
+    .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))
+    .reduce<Map<string, TelemetryEvent>>(
+      (map, event) => (map.has(event.sessionId) ? map : map.set(event.sessionId, event)),
+      new Map(),
+    );
+  const searches = Array.from(searchBySession.values());
+  const selections = filteredEvents.filter((event) => event.eventType === "reuse_selected");
+  const blocked = filteredEvents.filter((event) => event.eventType === "reuse_blocked");
+
+  const convertedSessions = searches.filter((search) =>
+    selections.some((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt),
+  );
+  const selectionTimes = convertedSessions.map((search) => {
+    const firstSelection = selections
+      .filter((selection) => selection.sessionId === search.sessionId && selection.occurredAt > search.occurredAt)
+      .sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))[0];
+    return (new Date(firstSelection.occurredAt).getTime() - new Date(search.occurredAt).getTime()) / 1000;
+  });
+
+  const terminalRequests = filteredRequests.filter((request) => ["Fulfilled", "Declined"].includes(request.status));
+  const openRequests = filteredRequests.filter((request) => !["Fulfilled", "Declined"].includes(request.status));
+  const pendingReviewAging = { under7: 0, days7To14: 0, days15To30: 0, over30: 0 };
+  openRequests.forEach((request) => {
+    const age = daysBetween(request.submittedAt, asOfDate);
+    if (age < 7) pendingReviewAging.under7 += 1;
+    else if (age <= 14) pendingReviewAging.days7To14 += 1;
+    else if (age <= 30) pendingReviewAging.days15To30 += 1;
+    else pendingReviewAging.over30 += 1;
+  });
+
+  const metadataCompletenessDistribution = { under70: 0, from70To84: 0, from85To94: 0, from95To100: 0 };
+  filteredAssets.forEach((asset) => {
+    if (asset.metadataCompleteness < 70) metadataCompletenessDistribution.under70 += 1;
+    else if (asset.metadataCompleteness <= 84) metadataCompletenessDistribution.from70To84 += 1;
+    else if (asset.metadataCompleteness <= 94) metadataCompletenessDistribution.from85To94 += 1;
+    else metadataCompletenessDistribution.from95To100 += 1;
+  });
+
+  const filteredFailed = failedSearches.filter((search) =>
+    withinFilters(
+      {
+        occurredAt: search.occurredAt,
+        discipline: search.activeFilters.discipline ?? null,
+        contentType: search.activeFilters.contentType ?? null,
+        software: search.activeFilters.software ?? null,
+      },
+      filters,
+    ),
+  );
+
+  const disciplines = Array.from(
+    new Set(
+      [
+        ...filteredAssets.map((asset) => asset.discipline),
+        ...filteredRequests.map((request) => request.discipline),
+        ...filteredFailed.map((search) => search.activeFilters.discipline),
+      ].filter(Boolean),
+    ),
+  ).sort();
+
+  const unmetDemandByDiscipline = disciplines
+    .map((discipline) => {
+      const zeroResultSearches =
+        filteredFailed.filter((search) => search.activeFilters.discipline === discipline).length +
+        searches.filter((search) => search.discipline === discipline && search.resultCount === 0).length;
+      const open = openRequests.filter((request) => request.discipline === discipline).length;
+      return { discipline: discipline ?? "Unspecified", zeroResultSearches, openRequests: open, total: zeroResultSearches + open };
+    })
+    .filter((entry) => entry.total > 0);
+
+  const staleApprovedAssets = filteredAssets
+    .filter((asset) => asset.approvalStatus === "Approved" && daysBetween(asset.lastUpdated, asOfDate) > 365)
+    .sort((a, b) => a.assetId.localeCompare(b.assetId));
+  const mostReusedApprovedAssets = filteredAssets
+    .filter((asset) => asset.approvalStatus === "Approved")
+    .sort((a, b) => b.usageCount - a.usageCount || a.assetId.localeCompare(b.assetId));
+  const medianOpenAge = median(openRequests.map((request) => daysBetween(request.submittedAt, asOfDate)));
+
+  const opportunityCards: ProductOpportunityCard[] = [];
+  const searchesByDiscipline = new Map<string, { total: number; zero: number }>();
+  searches.forEach((search) => {
+    const key = search.discipline ?? "Unspecified";
+    const current = searchesByDiscipline.get(key) ?? { total: 0, zero: 0 };
+    current.total += 1;
+    if (search.resultCount === 0) current.zero += 1;
+    searchesByDiscipline.set(key, current);
+  });
+  searchesByDiscipline.forEach((counts, discipline) => {
+    if (counts.total >= 10 && counts.zero / counts.total > 0.2) {
+      opportunityCards.push({
+        title: "Coverage gap",
+        observation: `Zero-result rate crossed the investigation threshold for ${discipline}.`,
+        evidence: `${counts.zero} of ${counts.total} ${discipline} search sessions returned zero results. Trigger: >20% zero-result rate with at least 10 searches.`,
+        discoveryQuestion: "Which recurring search intents are missing, and are taxonomy or content supply the primary problem?",
+      });
+    }
+  });
+
+  const totalSelections = selections.length + blocked.length;
+  const staleSelections = selections.filter((selection) => staleApprovedAssets.some((asset) => asset.assetId === selection.assetId)).length;
+  if (staleApprovedAssets.length >= 5 && totalSelections > 0 && staleSelections / totalSelections >= 0.2) {
+    opportunityCards.push({
+      title: "High-use stale content",
+      observation: "Stale approved records are material in synthetic selection behavior.",
+      evidence: `${staleApprovedAssets.length} stale approved assets represented ${staleSelections} of ${totalSelections} selection attempts. Trigger: >=5 stale approved assets and >=20% of selections.`,
+      discoveryQuestion: "What review evidence would content owners need to refresh these records?",
+    });
+  }
+  if (medianOpenAge !== null && medianOpenAge > 14) {
+    opportunityCards.push({
+      title: "Governance bottleneck",
+      observation: "Open request age suggests an operational triage discussion.",
+      evidence: `Median open request age is ${medianOpenAge} days. Trigger: median open request age >14 days.`,
+      discoveryQuestion: "Is the delay caused by missing context, capacity, ownership, or decision rights?",
+    });
+  }
+  const highDuplicateCount = filteredAssets.filter((asset) => asset.duplicateRisk === "High").length;
+  if (filteredAssets.length > 0 && highDuplicateCount / filteredAssets.length > 0.1) {
+    opportunityCards.push({
+      title: "Duplicate governance",
+      observation: "High duplicate-risk records are prominent in this context.",
+      evidence: `${highDuplicateCount} of ${filteredAssets.length} assets have High duplicate risk. Trigger: >10% of assets in context.`,
+      discoveryQuestion: "Where do naming, ownership, or lifecycle rules fail to distinguish alternatives?",
+    });
+  }
+
+  return {
+    searchSuccessRate: safeRate(searches.filter((search) => (search.resultCount ?? 0) > 0).length, searches.length),
+    zeroResultRate: safeRate(searches.filter((search) => search.resultCount === 0).length, searches.length),
+    searchToSelectionConversion: safeRate(convertedSessions.length, searches.length),
+    approvedSelectionRate: safeRate(selections.filter((selection) => selection.approvalStatusAtEvent === "Approved").length, selections.length),
+    blockedAttemptRate: safeRate(blocked.length, selections.length + blocked.length),
+    medianTimeToSelectionSeconds: median(selectionTimes),
+    requestFulfillmentRate: safeRate(terminalRequests.filter((request) => request.status === "Fulfilled").length, terminalRequests.length),
+    medianOpenRequestAgeDays: medianOpenAge,
+    pendingReviewAging,
+    metadataCompletenessDistribution,
+    staleApprovedAssets,
+    mostReusedApprovedAssets,
+    unmetDemandByDiscipline,
+    opportunityCards,
+  };
+}

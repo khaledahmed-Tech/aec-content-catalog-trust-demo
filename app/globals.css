@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --canvas: #f6f3ec; --surface: #ffffff; --ink: #24323a; --muted-ink: #617078;
+  --action: #a9543d; --action-hover: #8e432f; --success: #66775b;
+  --caution: #a66a18; --warning: #963f36; --border: #ddd7cc; --module-accent: #e9e2d5;
+}
+@layer base { body { background: var(--canvas); color: var(--ink); @apply antialiased; } :focus-visible { @apply outline outline-2 outline-offset-2; outline-color: var(--action); } }
+@layer components {
+  .card { border-color: var(--border); @apply rounded-2xl border bg-white p-6 shadow-sm; }
+  .eyebrow { color: var(--action); @apply text-xs font-bold uppercase tracking-[0.18em]; }
+  .pill { @apply inline-flex rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-700; }
+  .button { background: var(--action); @apply items-center justify-center rounded-lg px-4 py-2.5 text-sm font-semibold text-white transition; }
+  .button:hover { background: var(--action-hover); }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; } }
