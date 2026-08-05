@@ -58,5 +58,5 @@ function Select({ label, value, options, onChange }: { label: string; value: str
 function groupRequests(requests: ContentRequest[]) {
   const counts = new Map<string, number>();
   requests.forEach((request) => { const key = `${request.discipline} · ${request.requestType}`; counts.set(key, (counts.get(key) ?? 0) + 1); });
-  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([label, value]) => ({ label, value }));
+  return Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([label, value]) => ({ label, value }));
 }
