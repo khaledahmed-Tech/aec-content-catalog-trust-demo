@@ -41,7 +41,7 @@ describe("trust scoring and eligibility", () => {
     expect(calculateTrustScore({ ...base, lastUpdated: "2025-08-02" }).components.recordFreshness).toBe(5);
     expect(calculateTrustScore({ ...base, lastUpdated: "2024-08-03" }).components.recordFreshness).toBe(5);
     expect(calculateTrustScore({ ...base, lastUpdated: "2024-08-02" }).components.recordFreshness).toBe(0);
-    expect(calculateTrustScore({ ...base, metadataCompleteness: 84, duplicateRisk: "Medium" }).band).toBe("Moderate");
+    expect(calculateTrustScore({ ...base, metadataCompleteness: 84, duplicateRisk: "High" }).band).toBe("Moderate");
     expect(calculateTrustScore({ ...base, metadataCompleteness: 0, duplicateRisk: "High" }).band).toBe("Low");
   });
 });
